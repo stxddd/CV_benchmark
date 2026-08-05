@@ -77,6 +77,7 @@ def select_model():
         ("YOLOv10n", "yolov10n.onnx"),
         ("YOLOv11n", "yolo11n.onnx"),
         ("YOLO26n", "yolo26n.onnx"),
+        ("LeYOLONano", "LeYOLONano.onnx")
     ]
 
 
