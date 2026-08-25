@@ -12,7 +12,7 @@ from typing import Any
 try:
     import onnx
     from onnx import numpy_helper, shape_inference
-except ImportError as exc:  # pragma: no cover - runtime guard only
+except ImportError as exc:
     raise SystemExit(
         "This script requires the 'onnx' package. Install it with: pip install onnx"
     ) from exc
@@ -290,7 +290,14 @@ def print_markdown(rows: list[ModelRow]) -> None:
 
 
 def print_pretty_table(rows: list[ModelRow], root: Path) -> None:
-    headers = ["Модель", "Параметры, млн", "КОПТс", "Размер, МБ", "mAP50-95, %", "Статус"]
+    headers = [
+        "Модель",
+        "Параметры, млн",
+        "КОПТс",
+        "Размер, МБ",
+        "mAP50-95, %",
+        "Статус",
+    ]
 
     display_rows: list[list[str]] = []
     for row in rows:
@@ -345,7 +352,11 @@ def write_csv(rows: list[ModelRow], output_path: Path) -> None:
                     f"{row.params_m:.6f}",
                     "" if row.gmacs is None else f"{row.gmacs:.6f}",
                     f"{row.size_mb:.6f}",
-                    "" if row.map5095 is None else f"{metric_to_percent(row.map5095):.4f}",
+                    (
+                        ""
+                        if row.map5095 is None
+                        else f"{metric_to_percent(row.map5095):.4f}"
+                    ),
                 ]
             )
 
