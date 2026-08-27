@@ -2,44 +2,50 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+import importlib.util
 import math
-import re
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
+
+import cv2
+
+from inference_common import create_session, draw_detections
 
 try:
     import onnx
-    from onnx import numpy_helper, shape_inference
+    from onnx import shape_inference
 except ImportError as exc:
-    raise SystemExit(
-        "This script requires the 'onnx' package. Install it with: pip install onnx"
-    ) from exc
+    raise SystemExit("Install benchmark dependencies: pip install -r requirements.txt") from exc
 
 
 @dataclass
 class ModelRow:
     name: str
     path: Path
-    params_m: float | None
-    gmacs: float | None
-    size_mb: float
-    map5095: float | None
+    params_m: float | None = None
+    gmacs: float | None = None
+    size_mb: float = 0.0
+    frames: int = 0
+    avg_fps: float | None = None
+    min_fps: float | None = None
+    max_fps: float | None = None
+    avg_latency_ms: float | None = None
+    min_latency_ms: float | None = None
+    max_latency_ms: float | None = None
+    video_path: Path | None = None
     error: str | None = None
 
 
 DISPLAY_NAMES = {
     "efficientdet_lite0": "EfficientDet-Lite0",
-    "efficientdet_lite1": "EfficientDet-Lite1",
-    "nanodet-plus-m": "NanoDet-Plus-M",
-    "nanodet-plus-m_320": "NanoDet-Plus-M",
     "nanodet-plus-m-1.5x_320": "NanoDet-Plus-M 1.5x",
     "picodet_s_320_coco": "PicoDet-S",
     "ssd_mobilenet_v2": "SSD MobileNet V2",
-    "ssd_mobilenet_v3": "SSD MobileNet V3",
-    "ssdlite_mobilenet_v3_large": "SSDLite MobileNet V3 Large",
-    "LeYOLONano": "LeYOLONano",
+    "LeYOLONano": "LeYOLO Nano",
     "yolov5nu": "YOLOv5n-u",
     "yolov8n": "YOLOv8n",
     "yolov10n": "YOLOv10n",
@@ -48,63 +54,62 @@ DISPLAY_NAMES = {
 }
 
 
+SCRIPT_BY_MODEL = {
+    "efficientdet_lite0": "EfficientDet_inference/main.py",
+    "nanodet-plus-m-1.5x_320": "NanoDet-Plus_inference/main.py",
+    "picodet_s_320_coco": "PicoDet-s_inference/main.py",
+    "ssd_mobilenet_v2": "ssd_mobilenet_inference/v2_main.py",
+    "LeYOLONano": "yolo_inference/main.py",
+    "yolov5nu": "yolo_inference/main.py",
+    "yolov8n": "yolo_inference/main.py",
+    "yolov10n": "yolo_inference/main.py",
+    "yolo11n": "yolo_inference/main.py",
+    "yolo26n": "yolo_inference/main.py",
+}
+
+THRESHOLDS = {
+    "efficientdet_lite0": 0.30,
+    "nanodet-plus-m-1.5x_320": 0.45,
+    "picodet_s_320_coco": 0.45,
+    "ssd_mobilenet_v2": 0.55,
+}
+
+MODEL_ALIASES = {
+    "efficientdet": "efficientdet_lite0",
+    "nanodet": "nanodet-plus-m-1.5x_320",
+    "picodet": "picodet_s_320_coco",
+    "ssd_v2": "ssd_mobilenet_v2",
+    "leyolo_nano": "LeYOLONano",
+    "yolo5n": "yolov5nu",
+    "yolo8n": "yolov8n",
+    "yolo10n": "yolov10n",
+    "yolo11n": "yolo11n",
+    "yolo26n": "yolo26n",
+}
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Scan all ONNX models in the workspace and print a summary table."
-    )
+    parser = argparse.ArgumentParser(description="Benchmark every ONNX model on a video")
+    root = Path(__file__).resolve().parent
+    parser.add_argument("--root", type=Path, default=root)
+    parser.add_argument("--video", type=Path, default=root / "test.mp4")
+    parser.add_argument("--max-frames", type=int, default=400, help="Maximum frames to process (default: 400)")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--threads", type=int, default=4)
     parser.add_argument(
-        "--root",
-        type=Path,
-        default=Path(__file__).resolve().parent,
-        help="Root directory to search for .onnx files.",
+        "--models", nargs="+", choices=sorted(MODEL_ALIASES),
+        help="Models to test; omit to test all models",
     )
-    parser.add_argument(
-        "--metrics-json",
-        type=Path,
-        help=(
-            "Optional JSON file with mAP50-95 values. Keys may be filenames or relative paths."
-        ),
-    )
-    parser.add_argument(
-        "--output-csv",
-        type=Path,
-        help="Optional CSV output path.",
-    )
+    parser.add_argument("--output-csv", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=root / "benchmark_results")
+    parser.add_argument("--no-video", action="store_true", help="Do not save annotated videos")
     return parser.parse_args()
 
 
-def make_display_name(path: Path, root: Path) -> str:
-    stem = path.stem
-    if stem in DISPLAY_NAMES:
-        return DISPLAY_NAMES[stem]
-    relative = path.relative_to(root).with_suffix("").as_posix()
-    cleaned = re.sub(r"[_/]+", " ", relative)
-    return cleaned.replace("models ", "")
-
-
-def load_metrics(metrics_path: Path | None) -> dict[str, float]:
-    if not metrics_path:
-        return {}
-    if not metrics_path.exists():
-        raise FileNotFoundError(f"Metrics file not found: {metrics_path}")
-
-    data = json.loads(metrics_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("metrics-json must contain a JSON object")
-
-    metrics: dict[str, float] = {}
-    for key, value in data.items():
-        if value is None or value == "":
-            continue
-        metrics[str(key).replace("\\", "/")] = float(value)
-    return metrics
-
-
-def count_parameters(model: Any) -> int:
-    total = 0
-    for initializer in model.graph.initializer:
-        total += math.prod(initializer.dims)
-    return total
+def element_count(shape: list[int | None] | None) -> int | None:
+    if not shape or any(dim is None or dim <= 0 for dim in shape):
+        return None
+    return math.prod(shape)
 
 
 def tensor_shapes(model: Any) -> dict[str, list[int | None]]:
@@ -114,78 +119,15 @@ def tensor_shapes(model: Any) -> dict[str, list[int | None]]:
     def record(value_info: Any) -> None:
         if not value_info.type.HasField("tensor_type"):
             return
-        dims: list[int | None] = []
-        for dim in value_info.type.tensor_type.shape.dim:
-            if dim.HasField("dim_value"):
-                dims.append(int(dim.dim_value))
-            else:
-                dims.append(None)
-        shapes[value_info.name] = dims
+        shapes[value_info.name] = [
+            int(dim.dim_value) if dim.HasField("dim_value") else None
+            for dim in value_info.type.tensor_type.shape.dim
+        ]
 
-    for item in inferred.graph.input:
+    for item in (*inferred.graph.input, *inferred.graph.value_info, *inferred.graph.output):
         record(item)
-    for item in inferred.graph.value_info:
-        record(item)
-    for item in inferred.graph.output:
-        record(item)
-    for initializer in inferred.graph.initializer:
-        shapes[initializer.name] = [int(dim) for dim in initializer.dims]
-
+    shapes.update({item.name: list(map(int, item.dims)) for item in inferred.graph.initializer})
     return shapes
-
-
-def element_count(shape: list[int | None] | None) -> int | None:
-    if not shape:
-        return None
-    total = 1
-    for dim in shape:
-        if dim is None or dim <= 0:
-            return None
-        total *= dim
-    return total
-
-
-def conv_macs(node: Any, shapes: dict[str, list[int | None]]) -> float | None:
-    if len(node.input) < 2 or len(node.output) < 1:
-        return None
-    output_shape = shapes.get(node.output[0])
-    weight_shape = shapes.get(node.input[1])
-    if not output_shape or not weight_shape:
-        return None
-
-    out_elems = element_count(output_shape)
-    if out_elems is None or len(weight_shape) < 3:
-        return None
-
-    kernel_elems = math.prod(weight_shape[2:])
-    in_channels_per_group = weight_shape[1]
-    return float(out_elems * in_channels_per_group * kernel_elems)
-
-
-def gemm_macs(node: Any, shapes: dict[str, list[int | None]]) -> float | None:
-    if len(node.input) < 2 or len(node.output) < 1:
-        return None
-    lhs = shapes.get(node.input[0])
-    rhs = shapes.get(node.input[1])
-    out = shapes.get(node.output[0])
-    if not lhs or not rhs or not out:
-        return None
-
-    lhs_elems = element_count(lhs)
-    rhs_elems = element_count(rhs)
-    out_elems = element_count(out)
-    if lhs_elems is None or rhs_elems is None or out_elems is None:
-        return None
-
-    if len(lhs) >= 2 and len(rhs) >= 2:
-        m = lhs[-2]
-        k = lhs[-1]
-        n = rhs[-1]
-        if m is None or k is None or n is None:
-            return None
-        return float(m * n * k)
-
-    return None
 
 
 def estimate_gmacs(model: Any) -> float | None:
@@ -193,187 +135,177 @@ def estimate_gmacs(model: Any) -> float | None:
         shapes = tensor_shapes(model)
     except Exception:
         return None
-
-    total_macs = 0.0
-    saw_any = False
-
+    total = 0.0
+    found = False
     for node in model.graph.node:
-        op = node.op_type
-        macs: float | None = None
-        if op in {"Conv", "ConvTranspose"}:
-            macs = conv_macs(node, shapes)
-        elif op in {"Gemm", "MatMul"}:
-            macs = gemm_macs(node, shapes)
-
-        if macs is not None:
-            total_macs += macs
-            saw_any = True
-
-    if not saw_any:
-        return None
-    return total_macs / 1_000_000_000.0
-
-
-def lookup_metric(metrics: dict[str, float], root: Path, path: Path) -> float | None:
-    rel = path.relative_to(root).as_posix()
-    candidates = [rel, path.name]
-    for candidate in candidates:
-        if candidate in metrics:
-            return metrics[candidate]
-    for key, value in metrics.items():
-        if Path(key).name == path.name:
-            return value
-    return None
-
-
-def metric_to_percent(value: float | None) -> float | None:
-    if value is None:
-        return None
-    return value * 100.0 if value <= 1.5 else value
-
-
-def collect_rows(root: Path, metrics: dict[str, float]) -> list[ModelRow]:
-    rows: list[ModelRow] = []
-    for path in sorted(root.rglob("*.onnx")):
-        if "venv" in path.parts:
+        if len(node.input) < 2 or not node.output:
             continue
+        output_shape = shapes.get(node.output[0])
+        weight_shape = shapes.get(node.input[1])
+        if node.op_type in {"Conv", "ConvTranspose"} and output_shape and weight_shape and len(weight_shape) >= 3:
+            output_count = element_count(output_shape)
+            if output_count is not None:
+                total += output_count * math.prod(weight_shape[2:]) * weight_shape[1]
+                found = True
+        elif node.op_type in {"Gemm", "MatMul"}:
+            lhs, rhs = shapes.get(node.input[0]), shapes.get(node.input[1])
+            if lhs and rhs and len(lhs) >= 2 and len(rhs) >= 2 and lhs[-1] and rhs[-1]:
+                total += lhs[-2] * lhs[-1] * rhs[-1]
+                found = True
+    return total / 1e9 if found else None
 
-        size_mb = path.stat().st_size / (1024 * 1024)
-        map5095 = lookup_metric(metrics, root, path)
 
+def load_module(path: Path, root: Path) -> ModuleType:
+    name = f"benchmark_model_{path.stem}_{path.parent.name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(name, root / SCRIPT_BY_MODEL[path.stem])
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load inference script for {path.name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def benchmark_model(
+    path: Path,
+    root: Path,
+    video: Path,
+    warmup: int,
+    max_frames: int,
+    threads: int,
+    output_dir: Path | None,
+) -> ModelRow:
+    row = ModelRow(DISPLAY_NAMES.get(path.stem, path.stem), path, size_mb=path.stat().st_size / 1048576)
+    try:
+        model = onnx.load(str(path), load_external_data=False)
+        row.params_m = sum(math.prod(item.dims) for item in model.graph.initializer) / 1e6
+        row.gmacs = estimate_gmacs(model)
+        module = load_module(path, root)
+        session = create_session(path.resolve(), threads)
+        decode = getattr(module, "decode", None)
+        if decode is None:
+            decode = getattr(module, "decode_single", None) or getattr(module, "decode_pico", None)
+        if decode is None:
+            raise AttributeError(f"No decoder in {SCRIPT_BY_MODEL[path.stem]}")
+        input_name = session.get_inputs()[0].name
+        capture = cv2.VideoCapture(str(video))
+        if not capture.isOpened():
+            raise RuntimeError(f"Cannot open video: {video}")
+        writer = None
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in row.name)
+            row.video_path = output_dir / f"{safe_name}.mp4"
+        timings: list[float] = []
+        frame_index = 0
         try:
-            model = onnx.load(str(path), load_external_data=False)
-            params = count_parameters(model)
-            gmacs = estimate_gmacs(model)
-            params_m: float | None = params / 1_000_000.0
-            error: str | None = None
-        except Exception as exc:
-            params_m = None
-            gmacs = None
-            error = f"{type(exc).__name__}: {exc}"
+            while max_frames == 0 or row.frames < max_frames:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                start = time.perf_counter()
+                input_tensor = module.preprocess(frame)
+                outputs = session.run(None, {input_name: input_tensor})
+                threshold = THRESHOLDS.get(path.stem, 0.35)
+                detections = decode(outputs, frame.shape, threshold)
+                elapsed = time.perf_counter() - start
+                if output_dir is not None:
+                    if writer is None:
+                        height, width = frame.shape[:2]
+                        fps = capture.get(cv2.CAP_PROP_FPS)
+                        writer = cv2.VideoWriter(
+                            str(row.video_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                            fps if fps and fps > 0 else 25.0, (width, height),
+                        )
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Cannot create video: {row.video_path}")
+                    draw_detections(frame, detections)
+                    current_fps = 1.0 / max(elapsed, 1e-9)
+                    cv2.putText(
+                        frame, f"{row.name} | conf {threshold:.2f} | FPS {current_fps:.2f} | latency {elapsed * 1000:.2f} ms",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 220), 2,
+                    )
+                    writer.write(frame)
+                if frame_index >= warmup:
+                    timings.append(elapsed)
+                frame_index += 1
+                row.frames += 1
+        finally:
+            capture.release()
+            if writer is not None:
+                writer.release()
+        if not timings:
+            raise RuntimeError("Video has no measured frames after warmup")
+        row.avg_latency_ms = sum(timings) / len(timings) * 1000
+        row.min_latency_ms = min(timings) * 1000
+        row.max_latency_ms = max(timings) * 1000
+        fps = [1 / timing for timing in timings]
+        row.avg_fps, row.min_fps, row.max_fps = sum(fps) / len(fps), min(fps), max(fps)
+    except Exception as exc:
+        row.error = f"{type(exc).__name__}: {exc}"
+    return row
 
-        rows.append(
-            ModelRow(
-                name=path.stem,
-                path=path,
-                params_m=params_m,
-                gmacs=gmacs,
-                size_mb=size_mb,
-                map5095=map5095,
-                error=error,
-            )
-        )
-    return rows
+
+def fmt(value: float | None, digits: int = 2) -> str:
+    return "-" if value is None else f"{value:.{digits}f}"
 
 
-def fmt_number(value: float | None, digits: int = 2) -> str:
-    if value is None:
-        return "-"
-    return f"{value:.{digits}f}"
-
-
-def print_markdown(rows: list[ModelRow]) -> None:
-    print("| Модель | Параметры, млн | КОПТс | Размер, МБ | mAP50-95, % |")
-    print("|---|---:|---:|---:|---:|")
+def print_table(rows: list[ModelRow], video: Path) -> None:
+    headers = ["Model", "Frames", "FPS min", "FPS avg", "FPS max", "Latency avg ms", "Latency min ms", "Latency max ms", "Status"]
+    values = []
     for row in rows:
-        map_percent = metric_to_percent(row.map5095)
-        print(
-            f"| {row.path.parent.name}/{row.path.name} | {fmt_number(row.params_m)} | "
-            f"{fmt_number(row.gmacs)} | {fmt_number(row.size_mb)} | {fmt_number(map_percent)} |"
-        )
-
-    failures = [row for row in rows if row.error]
-    if failures:
-        print("\nПроблемные файлы:")
-        for row in failures:
-            print(f"- {row.path}: {row.error}")
-
-
-def print_pretty_table(rows: list[ModelRow], root: Path) -> None:
-    headers = [
-        "Модель",
-        "Параметры, млн",
-        "КОПТс",
-        "Размер, МБ",
-        "mAP50-95, %",
-        "Статус",
-    ]
-
-    display_rows: list[list[str]] = []
+        values.append([row.name, str(row.frames), fmt(row.min_fps), fmt(row.avg_fps), fmt(row.max_fps), fmt(row.avg_latency_ms), fmt(row.min_latency_ms), fmt(row.max_latency_ms), "OK" if not row.error else "ERR"])
+    widths = [max(len(header), *(len(row[i]) for row in values)) for i, header in enumerate(headers)]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    print(f"Video: {video.name}")
+    print(border)
+    print("|" + "|".join(f" {header.ljust(width)} " for header, width in zip(headers, widths)) + "|")
+    print(border)
+    for row in values:
+        print("|" + "|".join(f" {cell.ljust(width)} " for cell, width in zip(row, widths)) + "|")
+    print(border)
     for row in rows:
-        map_percent = metric_to_percent(row.map5095)
-        display_rows.append(
-            [
-                make_display_name(row.path, root),
-                fmt_number(row.params_m),
-                fmt_number(row.gmacs),
-                fmt_number(row.size_mb),
-                fmt_number(map_percent),
-                "OK" if not row.error else "ERR",
-            ]
-        )
-
-    widths = [len(header) for header in headers]
-    for row in display_rows:
-        for index, cell in enumerate(row):
-            widths[index] = max(widths[index], len(cell))
-
-    def line(left: str, fill: str, sep: str, right: str) -> str:
-        parts = [fill * (width + 2) for width in widths]
-        return left + sep.join(parts) + right
-
-    def render_row(row: list[str]) -> str:
-        cells = [f" {cell.ljust(widths[index])} " for index, cell in enumerate(row)]
-        return "|" + "|".join(cells) + "|"
-
-    print(line("+", "-", "+", "+"))
-    print(render_row(headers))
-    print(line("+", "=", "+", "+"))
-    for row in display_rows:
-        print(render_row(row))
-    print(line("+", "-", "+", "+"))
-
-    failures = [row for row in rows if row.error]
-    if failures:
-        print("\nПроблемные файлы:")
-        for row in failures:
-            print(f"- {make_display_name(row.path, root)}: {row.error}")
+        if row.error:
+            print(f"{row.name}: {row.error}")
+        elif row.video_path:
+            print(f"{row.name} video: {row.video_path}")
 
 
-def write_csv(rows: list[ModelRow], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["model", "params_m", "gmacs", "size_mb", "map50_95_pct"])
+def write_csv(rows: list[ModelRow], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["model", "path", "frames", "fps_min", "fps_avg", "fps_max", "latency_avg_ms", "latency_min_ms", "latency_max_ms", "params_m", "gmacs", "error"]
+    with path.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
         for row in rows:
-            writer.writerow(
-                [
-                    f"{row.path.parent.name}/{row.path.name}",
-                    f"{row.params_m:.6f}",
-                    "" if row.gmacs is None else f"{row.gmacs:.6f}",
-                    f"{row.size_mb:.6f}",
-                    (
-                        ""
-                        if row.map5095 is None
-                        else f"{metric_to_percent(row.map5095):.4f}"
-                    ),
-                ]
-            )
+            writer.writerow({
+                "model": row.name, "path": str(row.path), "frames": row.frames, "fps_min": row.min_fps, "fps_avg": row.avg_fps, "fps_max": row.max_fps,
+                "latency_avg_ms": row.avg_latency_ms, "latency_min_ms": row.min_latency_ms, "latency_max_ms": row.max_latency_ms, "params_m": row.params_m, "gmacs": row.gmacs, "error": row.error or "",
+            })
 
 
 def main() -> None:
     args = parse_args()
-    metrics = load_metrics(args.metrics_json)
-    rows = collect_rows(args.root, metrics)
-
-    if not rows:
-        raise SystemExit(f"No .onnx files found under {args.root}")
-
-    print_pretty_table(rows, args.root)
-
+    root, video = args.root.resolve(), args.video.resolve()
+    if not video.exists():
+        raise SystemExit(f"Video not found: {video}")
+    paths = [path for path in sorted(root.rglob("*.onnx")) if "venv" not in path.parts and path.stem in SCRIPT_BY_MODEL]
+    if args.models:
+        selected = {MODEL_ALIASES[name] for name in args.models}
+        paths = [path for path in paths if path.stem in selected]
+    if not paths:
+        raise SystemExit("Selected models were not found")
+    if not paths:
+        raise SystemExit(f"No supported ONNX models found under {root}")
+    print(f"Benchmark: {video.name}; warmup={args.warmup}; threads={args.threads}")
+    rows = []
+    for index, path in enumerate(paths, 1):
+        print(f"[{index}/{len(paths)}] {DISPLAY_NAMES.get(path.stem, path.stem)}...", flush=True)
+        rows.append(benchmark_model(path, root, video, args.warmup, args.max_frames, args.threads, None if args.no_video else args.output_dir))
+    print_table(rows, video)
     if args.output_csv:
         write_csv(rows, args.output_csv)
-        print(f"\nCSV written to: {args.output_csv}")
+        print(f"CSV written to: {args.output_csv}")
 
 
 if __name__ == "__main__":

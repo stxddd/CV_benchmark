@@ -1,112 +1,34 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import cv2
-import time
 import numpy as np
-import onnxruntime as ort
 
-MODEL_PATH = "ssd_mobilenet_v2.onnx"
-LABELS_PATH = "coco.names"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from inference_common import Detection, nms_indices  # noqa: E402
 
-CONF_THRESHOLD = 0.55
-NMS_THRESHOLD = 0.45
-
+MODEL_PATH = Path(__file__).with_name("ssd_mobilenet_v2.onnx")
 INPUT_SIZE = (300, 300)
-SOURCE = 0
 
-with open(LABELS_PATH, "r") as f:
-    class_names = [line.strip() for line in f.readlines()]
 
-session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
+def preprocess(frame: np.ndarray) -> np.ndarray:
+    image = cv2.cvtColor(cv2.resize(frame, INPUT_SIZE), cv2.COLOR_BGR2RGB)
+    return image[None].astype(np.uint8)
 
-cap = cv2.VideoCapture(SOURCE)
-prev_time = time.time()
-fps = 0.0
-frame_count = 0
 
-print("[INFO] V2 запущен. Нажми 'q' для выхода")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    h, w = frame.shape[:2]
-
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, INPUT_SIZE)
-    blob = np.expand_dims(img, axis=0).astype(np.uint8)
-
-    outputs = session.run(None, {input_name: blob})
-
-    boxes = outputs[1][0]
-    classes = outputs[2][0]
-    scores = outputs[4][0]
-    num_det = int(outputs[5][0])
-
-    det_boxes = []
-    det_scores = []
-    det_classes = []
-
-    for i in range(num_det):
-        score = float(scores[i])
-        if score < CONF_THRESHOLD:
+def decode(outputs: object, shape: tuple[int, ...], threshold: float) -> list[Detection]:
+    boxes, classes, scores = outputs[1][0], outputs[2][0], outputs[4][0]
+    count = min(int(outputs[5][0]), len(boxes))
+    height, width = shape[:2]
+    detections = []
+    for box, class_id, score in zip(boxes[:count], classes[:count], scores[:count]):
+        score = float(score)
+        if score < threshold:
             continue
+        detections.append(Detection((int(box[1] * width), int(box[0] * height), int(box[3] * width), int(box[2] * height)), score, int(class_id) - 1))
+    keep = nms_indices([detection.box for detection in detections], [detection.score for detection in detections], threshold, 0.45)
+    return [detections[index] for index in keep]
 
-        ymin, xmin, ymax, xmax = boxes[i]
-        x1 = int(xmin * w)
-        y1 = int(ymin * h)
-        x2 = int(xmax * w)
-        y2 = int(ymax * h)
 
-        det_boxes.append([x1, y1, x2 - x1, y2 - y1])
-        det_scores.append(score)
-        det_classes.append(int(classes[i]))
-
-    indices = cv2.dnn.NMSBoxes(det_boxes, det_scores, CONF_THRESHOLD, NMS_THRESHOLD)
-
-    if len(indices) > 0:
-        for i in indices.flatten():
-            x, y, bw, bh = det_boxes[i]
-            score = det_scores[i]
-            cls_id = det_classes[i]
-
-            label = (
-                class_names[cls_id - 1]
-                if 1 <= cls_id <= len(class_names)
-                else str(cls_id)
-            )
-
-            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                f"{label}: {score:.2f}",
-                (x, y - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 0),
-                2,
-            )
-
-    frame_count += 1
-    now = time.time()
-    if now - prev_time >= 1.0:
-        fps = frame_count / (now - prev_time)
-        prev_time = now
-        frame_count = 0
-
-    cv2.putText(
-        frame,
-        f"FPS: {fps:.1f} | V2",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2,
-    )
-
-    cv2.imshow("SSD MobileNet V2", frame)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
